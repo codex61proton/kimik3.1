@@ -1,5 +1,5 @@
-import { Suspense, useEffect, useRef } from 'react'
-import { Canvas, useThree } from '@react-three/fiber'
+import { Suspense, useEffect, useRef, useState } from 'react'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { CameraControls, AdaptiveDpr } from '@react-three/drei'
 import { Bloom, ChromaticAberration, EffectComposer, Noise, ToneMapping, Vignette } from '@react-three/postprocessing'
 import { BlendFunction, ToneMappingMode } from 'postprocessing'
@@ -68,7 +68,7 @@ function Rig() {
 
 function Effects({ mobile }: { mobile: boolean }) {
   return (
-    <EffectComposer multisampling={mobile ? 0 : 4}>
+    <EffectComposer multisampling={0} frameBufferType={THREE.HalfFloatType}>
       <Bloom mipmapBlur luminanceThreshold={0.75} luminanceSmoothing={0.25} intensity={mobile ? 0.9 : 1.15} radius={0.72} />
       <ChromaticAberration
         blendFunction={BlendFunction.NORMAL}
@@ -83,12 +83,61 @@ function Effects({ mobile }: { mobile: boolean }) {
   )
 }
 
+
+// Plain render path used when the composer output is black on a given GPU/driver.
+function LiteRender() {
+  useFrame(({ gl, scene, camera }) => {
+    gl.toneMapping = THREE.ACESFilmicToneMapping
+    gl.render(scene, camera)
+  }, 1)
+  return null
+}
+
+// Samples the presented frame; a pure-black result (clear colour is never 0) means the pipeline broke.
+function BlackFrameGuard({ onBroken }: { onBroken: (why: string) => void }) {
+  const gl = useThree((s) => s.gl)
+  const frames = useRef(0)
+  useEffect(() => {
+    const el = gl.domElement
+    const lost = (e: Event) => {
+      e.preventDefault()
+      onBroken('webglcontextlost')
+    }
+    el.addEventListener('webglcontextlost', lost)
+    return () => el.removeEventListener('webglcontextlost', lost)
+  }, [gl, onBroken])
+  useFrame(() => {
+    const n = ++frames.current
+    if (n !== 60 && n !== 180 && n !== 420) return
+    const ctx = gl.getContext()
+    gl.setRenderTarget(null)
+    const w = ctx.drawingBufferWidth
+    const h = ctx.drawingBufferHeight
+    const px = new Uint8Array(4)
+    let lit = 0
+    for (let i = 1; i < 6; i++)
+      for (let j = 1; j < 6; j++) {
+        ctx.readPixels(Math.floor((w * i) / 6), Math.floor((h * j) / 6), 1, 1, ctx.RGBA, ctx.UNSIGNED_BYTE, px)
+        if (px[0] | px[1] | px[2]) lit++
+      }
+    if (lit === 0) onBroken(`black frame #${n}`)
+  }, 2)
+  return null
+}
+
 export function Experience() {
   const mobile = typeof window !== 'undefined' && (window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 760)
+  const qs = new URLSearchParams(window.location.search)
+  const [lite, setLite] = useState(qs.get('fx') === '0' || localStorage.getItem('zone24-lite') === '1')
+  const onBroken = (why: string) => {
+    console.warn('[zone24] falling back to lite rendering:', why)
+    if (qs.get('fx') !== '1') localStorage.setItem('zone24-lite', '1')
+    setLite(true)
+  }
   return (
     <Canvas
       className="scene"
-      dpr={mobile ? [1, 1.6] : [1, 2]}
+      dpr={mobile ? [1, 1.5] : [1, 1.5]}
       gl={{ antialias: false, powerPreference: 'high-performance', alpha: false }}
       camera={{ fov: 42, near: 0.1, far: 900, position: [0, 26, 34] }}
       onCreated={(state) => {
@@ -102,7 +151,8 @@ export function Experience() {
         <Pitch />
         <Ball />
         <Rig />
-        <Effects mobile={mobile} />
+        {lite ? <LiteRender /> : <Effects mobile={mobile} />}
+        <BlackFrameGuard key={String(lite)} onBroken={onBroken} />
       </Suspense>
       <AdaptiveDpr pixelated={false} />
     </Canvas>
